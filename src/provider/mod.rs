@@ -12,6 +12,8 @@ pub mod secp_secq;
 // crate-private modules
 #[cfg(feature = "blitzar")]
 pub(crate) mod blitzar;
+#[cfg(feature = "pallas-gpu")]
+pub(crate) mod pallas_gpu;
 pub(crate) mod keccak;
 pub(crate) mod pedersen;
 #[cfg(feature = "io")]

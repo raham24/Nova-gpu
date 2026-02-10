@@ -1,96 +1,135 @@
-# Nova: High-speed recursive arguments from folding schemes
+# Nova-GPU: GPU-Accelerated Nova Recursive SNARKs
 
-Nova is a high-speed recursive SNARK (a SNARK is type cryptographic proof system that enables a prover to prove a mathematical statement to a verifier with a short proof and succinct verification, and a recursive SNARK enables producing proofs that prove statements about prior proofs). 
+This is a fork of [Microsoft Nova](https://github.com/microsoft/Nova) that adds **GPU-accelerated multi-scalar multiplication (MSM)** for the Pallas curve via CUDA. The GPU backend replaces the CPU MSM in Nova's Pedersen commitment engine, accelerating the most compute-intensive operation in IVC proof generation.
 
-More precisely, Nova achieves [incrementally verifiable computation (IVC)](https://iacr.org/archive/tcc2008/49480001/49480001.pdf), a powerful cryptographic primitive that allows a prover to produce a proof of correct execution of a "long running" sequential computations in an incremental fashion. For example, IVC enables the following: The prover takes as input a proof $\pi_i$ proving the first $i$ steps of its computation and then update it to produce a proof $\pi_{i+1}$ proving the correct execution of the first $i + 1$ steps. Crucially, the prover's work to update the proof does not depend on the number of steps executed thus far, and the verifier's work to verify a proof does not grow with the number of steps in the computation. IVC schemes including Nova have a wide variety of applications such as Rollups, verifiable delay functions (VDFs), succinct blockchains, incrementally verifiable versions of [verifiable state machines](https://eprint.iacr.org/2020/758.pdf), and, more generally, proofs of (virtual) machine executions (e.g., EVM, RISC-V). 
+## What Changed From Upstream Nova
 
-A distinctive aspect of Nova is that it is the simplest recursive proof system in the literature, yet it provides the fastest prover. Furthermore, it achieves the smallest verifier circuit (a key metric to minimize in this context): the circuit is constant-sized and its size is about 10,000 multiplication gates. Nova is constructed from a simple primitive called a *folding scheme*, a cryptographic primitive that reduces the task of checking two NP statements into the task of checking a single NP statement. 
+This fork introduces a `pallas-gpu` feature flag that offloads Pallas curve MSM to the GPU using a custom CUDA library ([pallas-gpu](https://github.com/raham24/pallas-gpu)). When enabled, all MSM operations on the Pallas curve are dispatched to the GPU automatically. When disabled, the original CPU codepath is used unchanged.
 
-## Details of the library
-This repository provides `nova-snark,` a Rust library implementation of Nova over a cycle of elliptic curves. Our code supports three curve cycles: (1) Pallas/Vesta, (2) BN254/Grumpkin, and (3) secp/secq. 
+### Modified Files
 
-At its core, Nova relies on a commitment scheme for vectors. Compressing IVC proofs using Spartan relies on interpreting commitments to vectors as commitments to multilinear polynomials and prove evaluations of committed polynomials. Our code implements two commitment schemes and evaluation arguments: 
-1. Pedersen commitments with IPA-based evaluation argument (supported on all three curve cycles), and
-2. HyperKZG commitments and evaluation argument (supported on curves with pairings e.g., BN254).
-    
-For more details on using  HyperKZG, please see the test `test_ivc_nontrivial_with_compression`. The HyperKZG instantiation requires a universal trusted setup (the so-called "powers of tau"). In the `setup` method in `src/provider/hyperkzg.rs`, one can load group elements produced in an existing KZG trusted setup (that was created for other proof systems based on univariate polynomials such as Plonk or variants). We have facility to load an existing setup, but the top-level APIs do not currently support this. 
+| File | Change |
+|------|--------|
+| `Cargo.toml` | Added `pallas-gpu` optional dependency and feature flag |
+| `src/provider/mod.rs` | Conditionally includes `pallas_gpu` module |
+| `src/provider/pasta.rs` | Manual `DlogGroupExt` impl for Pallas with GPU dispatch |
+| `src/provider/pallas_gpu.rs` | **New** -- GPU MSM wrapper that bridges Nova types to the CUDA library |
 
-We also implement a SNARK, based on [Spartan](https://eprint.iacr.org/2019/550.pdf), to compress IVC proofs produced by Nova. There are two variants, one that does *not* use any preprocessing and another that uses preprocessing of circuits to ensure that the verifier's run time does not depend on the size of the step circuit. The preprocessing variant of Spartan is called MicroSpartan and is described in the [MicroNova](https://eprint.iacr.org/2024/2099) paper.
+### How GPU Dispatch Works
 
-Prior to compression, the IVC proof is folded with a random instance, which makes the proof zero-knowledge. The details of this technique are described in the HyperNova paper.
+In `src/provider/pasta.rs`, the `DlogGroupExt::vartime_multiscalar_mul` implementation for `pallas::Point` is conditionally compiled:
 
-## Supported front-ends
-A front-end is a tool to take a high-level program and turn it into an intermediate representation (e.g., a circuit) that can be used to prove executions of the program on concrete inputs. There are three supported ways to write high-level programs in a form that can be proven with Nova.
+```rust
+#[cfg(feature = "pallas-gpu")]
+fn vartime_multiscalar_mul(scalars: &[Self::Scalar], bases: &[Self::AffineGroupElement]) -> Self {
+    super::pallas_gpu::vartime_multiscalar_mul(scalars, bases)
+}
 
-1. The native APIs of Nova accept circuits expressed with bellman-style circuits. See [minroot.rs](https://github.com/microsoft/Nova/blob/main/examples/minroot.rs) or [sha256.rs](https://github.com/microsoft/Nova/blob/main/benches/sha256.rs) for examples.
+#[cfg(not(feature = "pallas-gpu"))]
+fn vartime_multiscalar_mul(scalars: &[Self::Scalar], bases: &[Self::AffineGroupElement]) -> Self {
+    msm(scalars, bases)  // original CPU Pippenger
+}
+```
 
-2. Circom: A DSL and a compiler to transform high-level program expressed in its language into a circuit. There exist middleware to turn output of circom into a form suitable for proving with Nova. See [Nova Scotia](https://github.com/nalinbhardwaj/Nova-Scotia) and [Circom Scotia](https://github.com/lurk-lab/circom-scotia). In the future, we will add examples in the Nova repository to use these tools with Nova.
+### Data Flow
 
-## Tests and examples
-By default, we enable the `asm` feature of an underlying library (which boosts performance by up to 50\%). If the library fails to build or run, one can pass `--no-default-features` to `cargo` commands noted below.
+1. **Rust side** (`pallas_gpu.rs`): Converts `halo2curves` field elements to standard (non-Montgomery) form via `to_repr()`, packs them as `[u64; 4]` limbs
+2. **GPU side** (`pallas-gpu` crate): Receives standard-form points, converts to Montgomery form on-device, runs Pippenger MSM with CUDA kernels, converts result back to standard form
+3. **Rust side**: Reconstructs `pallas::Point` from the GPU result via `from_repr()`
 
-To run tests (we recommend the release mode to drastically shorten run times):
-```text
+### The pallas-gpu CUDA Library
+
+The GPU MSM implementation lives in a separate crate ([pallas-gpu](https://github.com/raham24/pallas-gpu)) with the following architecture:
+
+```
+pallas-gpu/
+├── cuda/
+│   ├── pallas_field.cuh/.cu   -- Montgomery field arithmetic (CIOS method, 8x32-bit limbs)
+│   ├── pallas_curve.cuh/.cu   -- Point operations (homogeneous projective coordinates)
+│   └── pallas_msm.cu          -- Pippenger MSM kernels (window=8, parallel bucket accumulation)
+├── src/lib.rs                 -- Rust FFI bindings
+└── build.rs                   -- CUDA compilation via nvcc
+```
+
+Key implementation details:
+- **Coordinates**: Homogeneous projective (affine = X/Z, Y/Z) using EFD add-1998-cmo-2 formulas
+- **Field arithmetic**: Montgomery multiplication via CIOS with 8x32-bit limbs
+- **MSM algorithm**: Pippenger's with 8-bit windows, 255 buckets per window, summation by parts
+- **Parallelization**: Atomic bucket accumulation across thread blocks; serial fallback for < 64 points
+
+## Requirements
+
+### Standard (CPU only)
+Same as upstream Nova -- Rust 1.79+.
+
+### GPU acceleration
+- **NVIDIA GPU** with Compute Capability 8.0+ (Ampere, Ada Lovelace, or newer)
+- **CUDA Toolkit** 11.0+
+- **Linux** (tested on Ubuntu with NVIDIA GeForce RTX 4080)
+
+## Building and Testing
+
+### CPU only (default, same as upstream)
+
+```bash
 cargo test --release
 ```
 
-To run an example:
-```text
+### With GPU acceleration
+
+```bash
+cargo test --features pallas-gpu --release
+```
+
+To run only the GPU MSM tests:
+
+```bash
+cargo test --features pallas-gpu --release -- test_gpu_msm --nocapture
+```
+
+### Running an example
+
+```bash
 cargo run --release --example minroot
 ```
 
+## About Nova
+
+Nova is a high-speed recursive SNARK that achieves [incrementally verifiable computation (IVC)](https://iacr.org/archive/tcc2008/49480001/49480001.pdf). It allows a prover to produce a proof of correct execution of a long-running sequential computation in an incremental fashion, where the prover's work to update the proof does not depend on the number of steps executed thus far. Nova is constructed from a simple primitive called a *folding scheme*, which reduces the task of checking two NP statements into the task of checking a single NP statement.
+
+This repository provides `nova-snark`, a Rust library implementation of Nova over a cycle of elliptic curves. The code supports three curve cycles: (1) Pallas/Vesta, (2) BN254/Grumpkin, and (3) secp/secq.
+
+At its core, Nova relies on a commitment scheme for vectors. The code implements two commitment schemes and evaluation arguments:
+1. Pedersen commitments with IPA-based evaluation argument (supported on all three curve cycles)
+2. HyperKZG commitments and evaluation argument (supported on curves with pairings, e.g., BN254)
+
+A SNARK based on [Spartan](https://eprint.iacr.org/2019/550.pdf) is used to compress IVC proofs. There are two variants: one without preprocessing and MicroSpartan (described in the [MicroNova](https://eprint.iacr.org/2024/2099) paper) which uses preprocessing to make verifier runtime independent of circuit size.
+
+## Supported Front-ends
+
+1. **Bellman-style circuits** (native): See [minroot.rs](https://github.com/microsoft/Nova/blob/main/examples/minroot.rs) or [sha256.rs](https://github.com/microsoft/Nova/blob/main/benches/sha256.rs)
+2. **Circom**: Via [Nova Scotia](https://github.com/nalinbhardwaj/Nova-Scotia) and [Circom Scotia](https://github.com/lurk-lab/circom-scotia)
+
 ## References
-The following paper, which appeared at CRYPTO 2022, provides details of the Nova proof system and a proof of security:
 
 [Nova: Recursive Zero-Knowledge Arguments from Folding Schemes](https://eprint.iacr.org/2021/370) \
 Abhiram Kothapalli, Srinath Setty, and Ioanna Tzialla \
 CRYPTO 2022
 
-For efficiency, our implementation of the Nova proof system is instantiated over a cycle of elliptic curves. The following paper specifies that instantiation and provides a proof of security:
-
 [Revisiting the Nova Proof System on a Cycle of Curves](https://eprint.iacr.org/2023/969) \
 Wilson Nguyen, Dan Boneh, and Srinath Setty \
 IACR ePrint 2023/969
-
-The zero-knowledge property is achieved using an idea described in the following paper:
 
 [HyperNova: Recursive arguments for customizable constraint systems](https://eprint.iacr.org/2023/573) \
 Abhiram Kothapalli and Srinath Setty \
 CRYPTO 2024
 
-The following paper describes an on-chain efficient version of Nova. We have open-sourced components of MicroNova including the HyperKZG polynomial commitment scheme and the MicroSpartan SNARK (which is provided in [ppsnark.rs](https://github.com/microsoft/Nova/blob/main/src/spartan/ppsnark.rs)):
-
 [MicroNova: Folding-based arguments with efficient (on-chain) verification](https://eprint.iacr.org/2024/2099) \
 Jiaxing Zhao, Srinath Setty, Weidong Cui, and Greg Zaverucha \
 IEEE S&P 2025
 
-## Contributing
+## Acknowledgments
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
-
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
-
-### Additional guidelines
-This codebase implements a sophisticated cryptographic protocol, necessitating proficiency in cryptography, mathematics, security, and software engineering. Given the inherent complexity, the introduction of subtle bugs is a pervasive concern, rendering the acceptance of substantial contributions exceptionally challenging. Consequently, external contributors are kindly urged to submit incremental, easily reviewable pull requests (PRs) that encapsulate well-defined changes.
-
-Our preference is to maintain code that is not only simple, but also easy to comprehend and maintain. This approach facilitates the auditing of code for correctness and security. To achieve this objective, we may prioritize code simplicity over minor performance enhancements, particularly when such improvements entail intricate, challenging-to-maintain code that disrupts abstractions.
-
-In the event that you propose performance-related changes through a PR, we anticipate the inclusion of reproducible benchmarks demonstrating substantial speedups across a range of typical circuits. This rigorous benchmarking ensures that the proposed changes meaningfully enhance the performance of a diverse set of applications built upon Nova. Each performance enhancement will undergo a thorough, case-by-case evaluation to ensure alignment with our commitment to maintaining codebase simplicity.
-
-Lastly, should you intend to submit a substantial PR, we kindly request that you initiate a GitHub issue outlining your planned changes, thereby soliciting feedback prior to committing substantial time to the implementation of said changes.
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
+- [Microsoft Nova](https://github.com/microsoft/Nova) -- the upstream project this fork is based on
+- [halo2curves](https://github.com/privacy-scaling-explorations/halo2curves) -- Pallas/Vesta curve implementations
+- [ICICLE](https://github.com/ingonyama-zk/icicle) -- reference for GPU cryptography patterns

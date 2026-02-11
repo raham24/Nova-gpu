@@ -55,7 +55,8 @@ Key implementation details:
 - **Coordinates**: Homogeneous projective (affine = X/Z, Y/Z) using EFD add-1998-cmo-2 formulas
 - **Field arithmetic**: Montgomery multiplication via CIOS with 8x32-bit limbs
 - **MSM algorithm**: Pippenger's with 8-bit windows, 255 buckets per window, summation by parts
-- **Parallelization**: Atomic bucket accumulation across thread blocks; serial fallback for < 64 points
+- **Parallelization**: 4-phase pipeline -- shared-memory bucket accumulation (per-block spinlocks) → cross-chunk reduction → bucket reduction → window combination. Adaptive chunk sizes (4K/16K/32K) and persistent GPU memory pool. Serial fallback for < 64 points.
+- **Performance**: ~2x speedup over CPU at 100K--1M points (benchmarked on RTX 4080)
 
 ## Requirements
 

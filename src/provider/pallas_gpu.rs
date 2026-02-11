@@ -172,4 +172,60 @@ mod tests {
             "GPU result should match CPU result for 1000 points"
         );
     }
+
+    #[test]
+    fn bench_cpu_vs_gpu() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        let sizes = [100_000, 200_000, 500_000, 1_000_000];
+        let warmup = 2;
+        let runs = 5;
+
+        let mut out = Vec::new();
+        out.push(format!("{:<12} {:>12} {:>12} {:>10}", "Points", "CPU (ms)", "GPU (ms)", "Speedup"));
+        out.push("-".repeat(50));
+
+        for &n in &sizes {
+            eprintln!("Benchmarking n={}...", n);
+            let scalars: Vec<pallas::Scalar> = (0..n).map(|_| pallas::Scalar::random(&mut OsRng)).collect();
+            let bases: Vec<pallas::Affine> = (0..n).map(|_| pallas::Point::random(&mut OsRng).to_affine()).collect();
+
+            for _ in 0..warmup {
+                let _ = msm(&scalars, &bases);
+                let _ = vartime_multiscalar_mul(&scalars, &bases);
+            }
+
+            let mut cpu_ms = Vec::new();
+            for _ in 0..runs {
+                let t = Instant::now();
+                let _ = msm(&scalars, &bases);
+                cpu_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let mut gpu_ms = Vec::new();
+            for _ in 0..runs {
+                let t = Instant::now();
+                let _ = vartime_multiscalar_mul(&scalars, &bases);
+                gpu_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+
+            let cpu_result = msm(&scalars, &bases);
+            let gpu_result = vartime_multiscalar_mul(&scalars, &bases);
+            assert_eq!(cpu_result.to_affine(), gpu_result.to_affine(), "Mismatch at n={}", n);
+
+            let ca = cpu_ms.iter().sum::<f64>() / runs as f64;
+            let ga = gpu_ms.iter().sum::<f64>() / runs as f64;
+            out.push(format!("{:<12} {:>12.3} {:>12.3} {:>9.2}x", n, ca, ga, ca / ga));
+        }
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let path = format!("{}/msm_benchmark.txt", home);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "=== Pallas MSM Benchmark: CPU vs GPU ===").unwrap();
+        writeln!(f, "Warmup: {}, Runs: {}\n", warmup, runs).unwrap();
+        for line in &out { writeln!(f, "{}", line).unwrap(); }
+        writeln!(f, "\nAll results verified correct (CPU == GPU).").unwrap();
+        eprintln!("\nResults written to {}", path);
+    }
 }

@@ -228,4 +228,139 @@ mod tests {
         writeln!(f, "\nAll results verified correct (CPU == GPU).").unwrap();
         eprintln!("\nResults written to {}", path);
     }
+
+    #[test]
+    #[ignore] // Run explicitly: cargo test -- bench_large_scale --nocapture --ignored
+    fn bench_large_scale() {
+        use std::io::Write;
+        use std::time::Instant;
+
+        // Large-scale sizes: 2M to 100M
+        // VRAM budget at 100M: ~12 GB (points 6.4 + scalars 3.2 + chunks 2.4)
+        // RTX 4080 has 16 GB, so 100M is the practical ceiling
+        let sizes: Vec<usize> = vec![
+            2_000_000,
+            5_000_000,
+            10_000_000,
+            20_000_000,
+            50_000_000,
+            100_000_000,
+        ];
+        let warmup = 1;
+        let runs = 3;
+        // Skip CPU for sizes above this (too slow -- CPU MSM at 100M would take ~50s per run)
+        let cpu_cutoff = 10_000_000;
+
+        let mut out = Vec::new();
+        out.push(format!(
+            "{:<14} {:>12} {:>12} {:>10} {:>14}",
+            "Points", "CPU (ms)", "GPU (ms)", "Speedup", "GPU pts/sec"
+        ));
+        out.push("-".repeat(66));
+
+        for &n in &sizes {
+            eprintln!("Generating {} random points and scalars...", n);
+            let gen_t = Instant::now();
+            let scalars: Vec<pallas::Scalar> = (0..n)
+                .map(|_| pallas::Scalar::random(&mut OsRng))
+                .collect();
+            let bases: Vec<pallas::Affine> = (0..n)
+                .map(|_| pallas::Point::random(&mut OsRng).to_affine())
+                .collect();
+            eprintln!(
+                "  Generated in {:.1}s. Benchmarking n={}...",
+                gen_t.elapsed().as_secs_f64(),
+                n
+            );
+
+            // GPU warmup
+            for _ in 0..warmup {
+                let _ = vartime_multiscalar_mul(&scalars, &bases);
+            }
+
+            // GPU benchmark
+            let mut gpu_ms = Vec::new();
+            for i in 0..runs {
+                let t = Instant::now();
+                let _ = vartime_multiscalar_mul(&scalars, &bases);
+                let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                gpu_ms.push(elapsed);
+                eprintln!("  GPU run {}/{}: {:.1} ms", i + 1, runs, elapsed);
+            }
+
+            // CPU benchmark (skip for very large sizes)
+            let mut cpu_ms = Vec::new();
+            if n <= cpu_cutoff {
+                // CPU warmup
+                for _ in 0..warmup {
+                    let _ = msm(&scalars, &bases);
+                }
+                for i in 0..runs {
+                    let t = Instant::now();
+                    let _ = msm(&scalars, &bases);
+                    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                    cpu_ms.push(elapsed);
+                    eprintln!("  CPU run {}/{}: {:.1} ms", i + 1, runs, elapsed);
+                }
+
+                // Correctness check
+                let cpu_result = msm(&scalars, &bases);
+                let gpu_result = vartime_multiscalar_mul(&scalars, &bases);
+                assert_eq!(
+                    cpu_result.to_affine(),
+                    gpu_result.to_affine(),
+                    "GPU/CPU mismatch at n={}",
+                    n
+                );
+                eprintln!("  Correctness verified (GPU == CPU)");
+            } else {
+                eprintln!("  Skipping CPU (n > {})", cpu_cutoff);
+            }
+
+            let ga = gpu_ms.iter().sum::<f64>() / runs as f64;
+            let pts_per_sec = n as f64 / (ga / 1000.0);
+
+            if !cpu_ms.is_empty() {
+                let ca = cpu_ms.iter().sum::<f64>() / runs as f64;
+                out.push(format!(
+                    "{:<14} {:>12.1} {:>12.1} {:>9.2}x {:>12.0}",
+                    n, ca, ga, ca / ga, pts_per_sec
+                ));
+            } else {
+                out.push(format!(
+                    "{:<14} {:>12} {:>12.1} {:>10} {:>12.0}",
+                    n, "--", ga, "--", pts_per_sec
+                ));
+            }
+        }
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let path = format!("{}/msm_benchmark_large.txt", home);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "=== Pallas MSM Large-Scale Benchmark ===").unwrap();
+        writeln!(f, "Hardware: RTX 4080 (76 SMs, 16 GB VRAM)").unwrap();
+        writeln!(f, "Warmup: {}, Runs: {}", warmup, runs).unwrap();
+        writeln!(f, "CPU comparison up to {}M points\n", cpu_cutoff / 1_000_000).unwrap();
+        for line in &out {
+            writeln!(f, "{}", line).unwrap();
+        }
+        writeln!(f).unwrap();
+        if cpu_cutoff < *sizes.last().unwrap() {
+            writeln!(
+                f,
+                "CPU vs GPU verified correct up to {}M points.",
+                cpu_cutoff / 1_000_000
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "Sizes above {}M: GPU-only (CPU too slow for practical comparison).",
+                cpu_cutoff / 1_000_000
+            )
+            .unwrap();
+        } else {
+            writeln!(f, "All results verified correct (CPU == GPU).").unwrap();
+        }
+        eprintln!("\nResults written to {}", path);
+    }
 }

@@ -183,8 +183,8 @@ mod tests {
         let runs = 5;
 
         let mut out = Vec::new();
-        out.push(format!("{:<12} {:>12} {:>12} {:>10}", "Points", "CPU (ms)", "GPU (ms)", "Speedup"));
-        out.push("-".repeat(50));
+        out.push(format!("{:<12} {:>12} {:>12} {:>10} {:>14}", "Points", "CPU (ms)", "GPU (ms)", "Speedup", "GPU pts/sec"));
+        out.push("-".repeat(66));
 
         for &n in &sizes {
             eprintln!("Benchmarking n={}...", n);
@@ -216,7 +216,8 @@ mod tests {
 
             let ca = cpu_ms.iter().sum::<f64>() / runs as f64;
             let ga = gpu_ms.iter().sum::<f64>() / runs as f64;
-            out.push(format!("{:<12} {:>12.3} {:>12.3} {:>9.2}x", n, ca, ga, ca / ga));
+            let pts_per_sec = n as f64 / (ga / 1000.0);
+            out.push(format!("{:<12} {:>12.3} {:>12.3} {:>9.2}x {:>12.0}", n, ca, ga, ca / ga, pts_per_sec));
         }
 
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
